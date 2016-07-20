@@ -2,6 +2,7 @@ import logging
 from json import loads, dumps
 from uuid import uuid4
 from math import ceil
+from time import time
 import tornadoredis
 from config import redis_users_settings, LIST_USERS_KEY, TRANSACTION_ATTEMPTS
 from tornado.gen import coroutine, Task
@@ -130,7 +131,18 @@ class SearchUserById(BaseUserHandler):
     def get(self, user_id):
         # get info about simmillar id
         user_id = str(user_id)
-        users = yield Task(self.redis_users.keys, pattern='*' + user_id + '*')
+        search_id = str(uuid4())
+        print('search_id', search_id)
+        start = time()
+        all_users = yield Task(self.redis_users.keys, '*%s*' % user_id)
+        end1 = time()
+        print('end get users', end1-start)
+        resp = yield Task(self.redis_users.lpush, search_id, *all_users)
+        end2 = time()
+        print('end set search', end2 - end1,end2-start, 'resp', resp)
+        users = yield Task(self.redis_users.lrange, key=search_id, start=0, end=30)
+        end3 = time()
+        print('end selection search', end3 - end2,end3-start)
         self.write(dumps(users))
         self.finish()
 
