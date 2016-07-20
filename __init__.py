@@ -1,0 +1,5 @@
+__title__ = 'user_service'
+__version__ = '0.1'
+__author__ = 'Anatolii Saevskii, ansaev@gmail.com'
+__license__ = 'MIT'
+__copyright__ = 'Copyright 2016 Anatolii Saevskii'
