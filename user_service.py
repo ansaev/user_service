@@ -2,11 +2,26 @@ import logging
 from json import loads, dumps
 from uuid import uuid4
 from math import ceil
-from time import time
+import time
 import tornadoredis
+from tornadoredis.exceptions import ResponseError
 from config import redis_users_settings, LIST_USERS_KEY, TRANSACTION_ATTEMPTS
 from tornado.gen import coroutine, Task
 from tornado.web import Application, RequestHandler
+SEARCH_BY_ID = """
+local users = redis.call('keys', ARGV[1])
+redis.call('select', ARGV[2] )
+for i = 0, #users do
+    redis.call('lpush', ARGV[3] , users[i])
+end
+return #users
+"""
+SEARCH_BY_NAME = """
+local resp = redis.call('scan', 0)
+while do
+    redis.call('lpush', ARGV[3] , users[i])
+end
+"""
 
 
 class BaseUserHandler(RequestHandler):
@@ -124,25 +139,55 @@ class UsersInfoHandler(BaseUserHandler):
         self.finish()
         return
 
+def sleep(callback):
+    time.sleep(2)
+    if callable(callback):
+        callback('ok')
 
 class SearchUserById(BaseUserHandler):
 
     @coroutine
     def get(self, user_id):
         # get info about simmillar id
-        user_id = str(user_id)
+        try:
+            page = int(self.get_argument('page'))
+        except ValueError:
+            self.set_status(status_code=400, reason='page should be int')
+            self.finish()
+            return
+        try:
+            limit = int(self.get_argument('limit'))
+        except ValueError:
+            self.set_status(status_code=400, reason='limit should be int')
+            self.finish()
+            return
+        if limit < 1:
+            self.set_status(status_code=400, reason='limit should be > 0')
+            self.finish()
+            return
+        if page < 1:
+            self.set_status(status_code=400, reason='page should be > 0')
+            self.finish()
+            return
+        user_id = '*' + str(user_id) + '*'
         search_id = str(uuid4())
-        print('search_id', search_id)
-        start = time()
-        all_users = yield Task(self.redis_users.keys, '*%s*' % user_id)
-        end1 = time()
-        print('end get users', end1-start)
-        resp = yield Task(self.redis_users.lpush, search_id, *all_users)
-        end2 = time()
-        print('end set search', end2 - end1,end2-start, 'resp', resp)
-        users = yield Task(self.redis_users.lrange, key=search_id, start=0, end=30)
-        end3 = time()
-        print('end selection search', end3 - end2,end3-start)
+        users_num = yield Task(self.redis_users.eval, SEARCH_BY_ID, [0], [user_id, 26, search_id])
+        pages = ceil(float(users_num)/float(limit))
+        if page > pages:
+            self.set_status(status_code=400, reason='page should be <= %d' % pages)
+            self.finish()
+            return
+        start_index = page * limit
+        end_index = start_index + limit
+        redis_searches = tornadoredis.Client(selected_db=26)
+        redis_searches.connect()
+        for i in range(TRANSACTION_ATTEMPTS):
+            users = yield Task(redis_searches.lrange, key=search_id, start=start_index, end=end_index)
+            if not isinstance(users, ResponseError):
+                break
+            else:
+                yield Task(sleep)
+        yield Task(redis_searches.disconnect)
         self.write(dumps(users))
         self.finish()
 
