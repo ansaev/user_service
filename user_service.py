@@ -1,26 +1,21 @@
 import logging
-from json import loads, dumps
+from json import dumps
 from uuid import uuid4
 from math import ceil
 import time
 import tornadoredis
 from tornadoredis.exceptions import ResponseError
-from config import redis_users_settings, LIST_USERS_KEY, TRANSACTION_ATTEMPTS
+from config import redis_users_settings, LIST_USERS_KEY, TRANSACTION_ATTEMPTS, SEARCHES_DB, NAMES_DB, SEARCH_LIVE_TIME, USERS_DB
 from tornado.gen import coroutine, Task
 from tornado.web import Application, RequestHandler
 SEARCH_BY_ID = """
+redis.call('select', ARGV[4])
 local users = redis.call('keys', ARGV[1])
 redis.call('select', ARGV[2] )
 for i = 0, #users do
     redis.call('lpush', ARGV[3] , users[i])
 end
 return #users
-"""
-SEARCH_BY_NAME = """
-local resp = redis.call('scan', 0)
-while do
-    redis.call('lpush', ARGV[3] , users[i])
-end
 """
 
 
@@ -87,6 +82,7 @@ class UsersInfoHandler(BaseUserHandler):
             self.set_status(status_code=400, reason='page should be > 0')
             self.finish()
             return
+        yield Task(self.redis_users.select, SEARCHES_DB)
         users_num = yield Task(self.redis_users.llen, LIST_USERS_KEY)
         pages = ceil(float(users_num)/float(limit))
         if page > pages:
@@ -113,12 +109,16 @@ class UsersInfoHandler(BaseUserHandler):
         try:
             user_id = str(uuid4())
             pipe = self.redis_users.pipeline(transactional=True)
+            pipe.select(USERS_DB)
             pipe.set(key=user_id, value=name)
+            pipe.select(SEARCHES_DB)
             pipe.lpush(LIST_USERS_KEY, user_id)
+            pipe.select(NAMES_DB)
+            pipe.lpush(name, user_id)
             errors = []
             for i in range(TRANSACTION_ATTEMPTS):
                 try:
-                    resp_s, resp_p = yield Task(pipe.execute)
+                    resp_s, resp_p, err_1, err_2, err_2, err_3 = yield Task(pipe.execute)
                     break
                 except BaseException as e:
                     errors.append(e)
@@ -147,7 +147,7 @@ def sleep(callback):
 class SearchUserById(BaseUserHandler):
 
     @coroutine
-    def get(self, user_id):
+    def get(self):
         # get info about simmillar id
         try:
             page = int(self.get_argument('page'))
@@ -165,13 +165,14 @@ class SearchUserById(BaseUserHandler):
             self.set_status(status_code=400, reason='limit should be > 0')
             self.finish()
             return
-        if page < 1:
-            self.set_status(status_code=400, reason='page should be > 0')
+        if page < 0:
+            self.set_status(status_code=400, reason='page should be >= 0')
             self.finish()
             return
+        user_id = self.get_argument('user_id')
         user_id = '*' + str(user_id) + '*'
         search_id = str(uuid4())
-        users_num = yield Task(self.redis_users.eval, SEARCH_BY_ID, [0], [user_id, 26, search_id])
+        users_num = yield Task(self.redis_users.eval, SEARCH_BY_ID, [0], [user_id, SEARCHES_DB, search_id, USERS_DB])
         pages = ceil(float(users_num)/float(limit))
         if page > pages:
             self.set_status(status_code=400, reason='page should be <= %d' % pages)
@@ -179,25 +180,77 @@ class SearchUserById(BaseUserHandler):
             return
         start_index = page * limit
         end_index = start_index + limit
-        redis_searches = tornadoredis.Client(selected_db=26)
-        redis_searches.connect()
+        yield Task(self.redis_users.select, SEARCHES_DB)
         for i in range(TRANSACTION_ATTEMPTS):
-            users = yield Task(redis_searches.lrange, key=search_id, start=start_index, end=end_index)
+            users = yield Task(self.redis_users.lrange, key=search_id, start=start_index, end=end_index)
             if not isinstance(users, ResponseError):
                 break
             else:
                 yield Task(sleep)
-        yield Task(redis_searches.disconnect)
+        else:
+            self.set_status(status_code=500, reason='cannot get data')
+            self.finish()
+            return
         self.write(dumps(users))
         self.finish()
 
 
 class SearchUserByName(BaseUserHandler):
+    @coroutine
+    def prepare(self):
+        self.redis_users = tornadoredis.Client(selected_db=NAMES_DB)
+        self.redis_users.connect()
 
     @coroutine
-    def get(self, name):
+    def get(self):
         # get info about simmillar names
-        self.write(name)
+        # check input params
+        try:
+            page = int(self.get_argument('page'))
+        except ValueError:
+            self.set_status(status_code=400, reason='page should be int')
+            self.finish()
+            return
+        try:
+            limit = int(self.get_argument('limit'))
+        except ValueError:
+            self.set_status(status_code=400, reason='limit should be int')
+            self.finish()
+            return
+        if limit < 1:
+            self.set_status(status_code=400, reason='limit should be > 0')
+            self.finish()
+            return
+        if page < 0:
+            self.set_status(status_code=400, reason='page should be >= 0')
+            self.finish()
+            return
+        # it's a new search, run lua script
+        name = self.get_argument('name')
+        name = '*' + str(name) + '*'
+        search_id = str(uuid4())
+        users_num = yield Task(self.redis_users.eval, SEARCH_BY_ID, [name, SEARCHES_DB, search_id, NAMES_DB])
+        print('users_num', users_num)
+        pages = ceil(float(users_num)/float(limit))
+        if page > pages:
+            self.set_status(status_code=400, reason='page should be <= %d' % pages)
+            self.finish()
+            return
+        start_index = page * limit
+        end_index = start_index + limit
+        yield Task(self.redis_users.select, SEARCHES_DB)
+        for i in range(TRANSACTION_ATTEMPTS):
+            users = yield Task(self.redis_users.lrange, key=search_id, start=start_index, end=end_index)
+            if not isinstance(users, ResponseError):
+                break
+            else:
+                yield Task(sleep)
+        else:
+            self.set_status(status_code=500, reason='cannot get data')
+            self.finish()
+            return
+        result = {'limit': limit, 'page': page, 'pages': pages, 'search_id': search_id, 'data': users}
+        self.write(dumps(result))
         self.finish()
 
 
@@ -205,6 +258,6 @@ def make_app():
     return Application([
         (r"/users/([a-zA-Z0-9-]+)", UserInfoHandler),
         (r"/users", UsersInfoHandler),
-        (r"/search_user_by_id/([a-zA-Z0-9-]+)", SearchUserById),
-        (r"/search_user_by_name/(.+)", SearchUserByName)
+        (r"/search_user_by_id", SearchUserById),
+        (r"/search_user_by_name", SearchUserByName)
     ])
