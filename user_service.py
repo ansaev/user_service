@@ -12,10 +12,10 @@ SEARCH_PERFIX = 'search:'
 USER_PERFIX = 'user:'
 SEARCH_BY_ID = """
 local users = redis.call('keys', ARGV[1])
-redis.call('select', ARGV[2] )
 for i = 0, #users do
-    redis.call('lpush', ARGV[3] , users[i])
+    redis.call('lpush', ARGV[2] , users[i])
 end
+redis.call('expire', ARGV[1] ,10)
 return #users
 """
 
@@ -188,13 +188,14 @@ class SearchUserById(BaseUserHandler):
             self.set_status(status_code=400, reason='limit should be > 0')
             self.finish()
             return
-        if page < 1:
-            self.set_status(status_code=400, reason='page should be > 0')
+        if page < 0:
+            self.set_status(status_code=400, reason='page should be >= 0')
             self.finish()
             return
-        user_id = '*' + str(user_id) + '*'
-        search_id = str(uuid4())
-        users_num = yield Task(self.redis_users.eval, SEARCH_BY_ID, [0], [user_id, 26, search_id])
+        user_id = USER_PERFIX + '*' + str(user_id) + '*'
+        search_id = SEARCH_PERFIX + user_id
+        # add cache story
+        users_num = yield Task(self.redis_users.eval, SEARCH_BY_ID, [0], [user_id, search_id])
         pages = ceil(float(users_num)/float(limit))
         if page > pages:
             self.set_status(status_code=400, reason='page should be <= %d' % pages)
@@ -202,15 +203,16 @@ class SearchUserById(BaseUserHandler):
             return
         start_index = page * limit
         end_index = start_index + limit
-        redis_searches = tornadoredis.Client(selected_db=26)
-        redis_searches.connect()
         for i in range(TRANSACTION_ATTEMPTS):
-            users = yield Task(redis_searches.lrange, key=search_id, start=start_index, end=end_index)
+            users = yield Task(self.redis_users.lrange, key=search_id, start=start_index, end=end_index)
             if not isinstance(users, ResponseError):
                 break
             else:
                 yield Task(sleep)
-        yield Task(redis_searches.disconnect)
+        else:
+            logging.critical('cannot read from redis')
+        yield Task(self.redis_users.disconnect)
+        users = [u[len(USER_PERFIX):] for u in users]
         self.write(dumps(users))
         self.finish()
 
