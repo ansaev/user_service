@@ -106,8 +106,8 @@ class UsersInfoHandler(BaseUserHandler):
             self.set_status(status_code=400, reason='limit should be > 0')
             self.finish()
             return
-        if page < 1:
-            self.set_status(status_code=400, reason='page should be > 0')
+        if page < 0:
+            self.set_status(status_code=400, reason='page should be >= 0')
             self.finish()
             return
         users_num = yield Task(self.redis_users.llen, LIST_USERS_KEY)
@@ -134,9 +134,9 @@ class UsersInfoHandler(BaseUserHandler):
             logging.error(str(encode_name_exep))
             return
         try:
-            user_id = USER_PERFIX + str(uuid4())
+            user_id = str(uuid4())
             pipe = self.redis_users.pipeline(transactional=True)
-            pipe.set(key=user_id, value=name)
+            pipe.set(key=USER_PERFIX + user_id, value=name)
             pipe.lpush(LIST_USERS_KEY, user_id)
             errors = []
             for i in range(TRANSACTION_ATTEMPTS):
