@@ -8,6 +8,8 @@ from tornadoredis.exceptions import ResponseError
 from config import redis_users_settings, LIST_USERS_KEY, TRANSACTION_ATTEMPTS
 from tornado.gen import coroutine, Task
 from tornado.web import Application, RequestHandler
+SEARCH_PERFIX = 'search:'
+USER_PERFIX = 'user:'
 SEARCH_BY_ID = """
 local users = redis.call('keys', ARGV[1])
 redis.call('select', ARGV[2] )
@@ -15,12 +17,6 @@ for i = 0, #users do
     redis.call('lpush', ARGV[3] , users[i])
 end
 return #users
-"""
-SEARCH_BY_NAME = """
-local resp = redis.call('scan', 0)
-while do
-    redis.call('lpush', ARGV[3] , users[i])
-end
 """
 
 
@@ -43,22 +39,49 @@ class UserInfoHandler(BaseUserHandler):
     @coroutine
     def get(self, user_id):
         # get info about user
-        redis_resp = yield Task(self.redis_users.get, key=user_id)
+        redis_resp = yield Task(self.redis_users.get, key=USER_PERFIX + str(user_id))
         if redis_resp is None:
             self.set_status(status_code=404, reason='no user with such user_id')
             self.finish()
             return
-        result = {}
+        result = {'user_id': user_id, 'name': str(redis_resp)}
+        self.write(dumps(result))
         self.finish()
         return
 
     @coroutine
     def post(self, user_id):
         # update name of user witth user_id
-        pass
+        name = str(self.get_body_argument('name'))
+        exist = yield Task(self.redis_users.exists, key=USER_PERFIX + str(user_id))
+        if not exist:
+            self.set_status(status_code=404, reason='cannot find user')
+            self.finish()
+            return
+        errors = []
+        for i in range(TRANSACTION_ATTEMPTS):
+            try:
+                set_status = yield Task(self.redis_users.set, key=USER_PERFIX + str(user_id), value=name)
+                if set_status is True:
+                    break
+            except BaseException as e:
+                errors.append(e)
+        else:
+            self.set_status(status_code=500, reason='cannot save user data')
+            self.finish()
+            logging.critical(msg='fail to save user data with errorrs: ' + str(errors))
+            return
 
+    @coroutine
     def delete(self, user_id):
         # delete user with id
+        redis_resp = yield Task(self.redis_users.delete, USER_PERFIX + str(user_id))
+        print(redis_resp, type)
+        if not redis_resp:
+            self.set_status(status_code=404, reason='no user with such user_id')
+            self.finish()
+            return
+        self.finish()
         pass
 
 
@@ -111,7 +134,7 @@ class UsersInfoHandler(BaseUserHandler):
             logging.error(str(encode_name_exep))
             return
         try:
-            user_id = str(uuid4())
+            user_id = USER_PERFIX + str(uuid4())
             pipe = self.redis_users.pipeline(transactional=True)
             pipe.set(key=user_id, value=name)
             pipe.lpush(LIST_USERS_KEY, user_id)
